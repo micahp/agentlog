@@ -383,6 +383,27 @@ def hermes_conn():
 # ---------------------------------------------------------------- discovery
 
 
+def claude_cwd(path):
+    """Claude Code stamps cwd on its records; the dir name is a lossy slug."""
+    try:
+        with open(path, "r", errors="replace") as handle:
+            for _ in range(40):
+                line = handle.readline()
+                if not line:
+                    break
+                if '"cwd"' not in line:
+                    continue
+                try:
+                    cwd = json.loads(line).get("cwd")
+                except Exception:
+                    continue
+                if cwd:
+                    return cwd
+    except OSError:
+        pass
+    return None
+
+
 def discover_claude(project):
     out = []
     if not CLAUDE_PROJECTS.is_dir():
@@ -394,7 +415,6 @@ def discover_claude(project):
     for directory in dirs:
         if not directory.is_dir():
             continue
-        cwd = "/" + directory.name.strip("-").replace("-", "/") if directory.name.startswith("-") else directory.name
         for path in directory.glob("*.jsonl"):
             try:
                 stat = path.stat()
@@ -402,7 +422,7 @@ def discover_claude(project):
                 continue
             if stat.st_size == 0:
                 continue
-            out.append(Session("claude", path.stem, path, cwd=cwd,
+            out.append(Session("claude", path.stem, path, cwd=claude_cwd(path),
                                started=stat.st_ctime, updated=stat.st_mtime))
     return out
 
@@ -694,6 +714,81 @@ def render_resume(session, args):
     return "\n".join(out)
 
 
+def codex_status(session):
+    """Structural rate-limit read from a codex rollout.
+
+    Ground truth is event_msg/task_complete carrying
+    error.codex_error_info == 'usage_limit_exceeded'. The token_count events
+    also carry a live rate_limits block with used_percent and resets_at.
+    """
+    info = {"state": "ok", "detail": "", "resets_at": None, "primary": None,
+            "secondary": None, "message": ""}
+    last_error = None
+    try:
+        handle = open(session.path, "r", errors="replace")
+    except OSError:
+        return info
+    with handle:
+        for line in handle:
+            if "usage_limit" not in line and '"rate_limits"' not in line \
+                    and '"error"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            payload = rec.get("payload") or {}
+            limits = payload.get("rate_limits")
+            if isinstance(limits, dict):
+                for key in ("primary", "secondary"):
+                    window = limits.get(key)
+                    if isinstance(window, dict):
+                        info[key] = window
+                        if key == "primary" and window.get("resets_at"):
+                            info["resets_at"] = window["resets_at"]
+            error = payload.get("error")
+            if payload.get("type") == "task_complete":
+                # a later clean task_complete means the limit was survived
+                last_error = error if isinstance(error, dict) else None
+    if last_error:
+        code = last_error.get("codex_error_info")
+        message = last_error.get("message") or ""
+        info["message"] = message
+        if code == "usage_limit_exceeded" or RATE_LIMIT_RE.search(message):
+            resets = info["resets_at"]
+            expired = bool(resets) and resets < time.time()
+            info["state"] = "expired" if expired else "rate_limited"
+            match = re.search(r"try again at ([^.]+)", message)
+            info["detail"] = ("resets " + match.group(1).strip()) if match \
+                else clip_line(message, 90)
+        else:
+            info["state"] = "error"
+            info["detail"] = clip_line(message, 90)
+    return info
+
+
+def text_status(session):
+    """Fallback for logs with no structured error record: read the last turn."""
+    info = {"state": "ok", "detail": "", "resets_at": None, "primary": None,
+            "secondary": None, "message": ""}
+    events = session.events()
+    for event in reversed(events[-4:]):
+        if event["kind"] != "text" or event["role"] not in ("assistant", "system"):
+            continue
+        text = (event["text"] or "").strip()
+        if RATE_LIMIT_RE.search(text[:400]):
+            info["state"] = "rate_limited"
+            info["detail"] = clip_line(text, 90)
+        break
+    return info
+
+
+def session_status(session):
+    if session.source == "codex":
+        return codex_status(session)
+    return text_status(session)
+
+
 def detect_end(events):
     for event in reversed(events[-12:]):
         text = event["text"] or ""
@@ -732,6 +827,56 @@ def cmd_list(args):
         print(session.summary_line())
     if not sessions:
         print("(no sessions found)")
+
+
+def cmd_status(args):
+    """Which recent sessions are rate limited, and which are still usable."""
+    sessions = discover(args.sources, args.project)[: args.limit]
+    rows, limited = [], []
+    for session in sessions:
+        info = session_status(session)
+        rows.append((session, info))
+        if info["state"] == "rate_limited":
+            limited.append((session, info))
+
+    if args.json:
+        print(json.dumps([
+            dict(ref=s.ref, source=s.source, id=s.sid, cwd=s.cwd,
+                 updated=s.updated, state=i["state"], detail=i["detail"],
+                 resets_at=i["resets_at"],
+                 primary_used_percent=(i["primary"] or {}).get("used_percent"),
+                 secondary_used_percent=(i["secondary"] or {}).get("used_percent"))
+            for s, i in rows], indent=2))
+        return
+
+    for session, info in rows:
+        mark, label = {
+            "rate_limited": ("\033[31m", "RATE LIMITED"),
+            "expired": ("\033[90m", "was limited"),
+            "error": ("\033[33m", "ERROR"),
+        }.get(info["state"], ("\033[32m", "ok"))
+        usage = ""
+        primary = info["primary"] or {}
+        if primary.get("used_percent") is not None:
+            usage = f"  {primary['used_percent']:.0f}% of 5h"
+            secondary = info["secondary"] or {}
+            if secondary.get("used_percent") is not None:
+                usage += f" / {secondary['used_percent']:.0f}% of weekly"
+        print(f"{mark}{label:<13}\033[0m {session.ref:<45} {age(session.updated):>8}"
+              f"  {(session.cwd or '?')}{usage}")
+        if info["detail"]:
+            print(f"              {info['detail']}")
+        if info["resets_at"] and info["state"] == "rate_limited":
+            print(f"              window resets {ts_fmt(info['resets_at'])}")
+
+    print()
+    if limited:
+        print(f"{len(limited)} of {len(rows)} recent session(s) rate limited. "
+              f"Hand the work off with:")
+        for session, _info in limited:
+            print(f"    agentlog resume {session.ref}")
+    else:
+        print(f"No rate limits in the last {len(rows)} sessions.")
 
 
 def cmd_show(args):
@@ -817,6 +962,12 @@ def main():
     p.add_argument("--since-hours", type=float, default=0)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_list)
+
+    p = add("status", "which recent sessions are rate limited")
+    p.add_argument("-n", "--limit", type=int, default=5,
+                   help="how many recent sessions to check (default 5)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_status)
 
     p = add("resume", "handoff brief for continuing a session")
     p.add_argument("ref", nargs="?", default="latest")
