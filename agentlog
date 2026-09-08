@@ -1,0 +1,863 @@
+#!/usr/bin/env python3
+"""agentlog - read/search session logs from Claude Code, Codex, and Hermes.
+
+Purpose: when one agent dies mid-task (rate limit, crash, context loss), another
+agent runs `agentlog resume latest` and gets a handoff brief with enough context
+to continue the same work.
+
+Sources:
+  claude  ~/.claude/projects/<slug>/<uuid>.jsonl
+  codex   ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+  hermes  ~/.hermes/state.db  (sessions + messages tables)
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path(os.path.expanduser("~"))
+CLAUDE_PROJECTS = HOME / ".claude" / "projects"
+CODEX_SESSIONS = HOME / ".codex" / "sessions"
+HERMES_DB = HOME / ".hermes" / "state.db"
+
+DEFAULT_PROJECT = "/root"
+SOURCES = ("claude", "codex", "hermes")
+
+RATE_LIMIT_RE = re.compile(
+    r"rate.?limit|429|usage limit|quota exceeded|too many requests|"
+    r"resets? at|upgrade to increase|out of (?:credits|tokens)",
+    re.I,
+)
+
+
+# ---------------------------------------------------------------- utilities
+
+
+def project_slug(path):
+    """/root/foo/bar -> -root-foo-bar (Claude Code's directory encoding)."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def ts_fmt(value):
+    if value is None:
+        return "?"
+    try:
+        if isinstance(value, (int, float)):
+            dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+        else:
+            s = str(value).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(value)[:16]
+
+
+def ts_epoch(value):
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        s = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def clip(text, limit):
+    text = "" if text is None else str(text)
+    text = text.replace("\r", "")
+    if limit and len(text) > limit:
+        return text[:limit] + f"\n    ... [+{len(text) - limit} chars truncated]"
+    return text
+
+
+def age(epoch):
+    if not epoch:
+        return "?"
+    delta = max(0, time.time() - epoch)
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    return f"{int(delta // 86400)}d ago"
+
+
+def iter_jsonl(path):
+    try:
+        with open(path, "r", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except Exception:
+                    continue
+    except OSError:
+        return
+
+
+def blocks_to_events(content):
+    """Anthropic-style content -> list of (kind, name, text)."""
+    out = []
+    if content is None:
+        return out
+    if isinstance(content, str):
+        if content.strip():
+            out.append(("text", None, content))
+        return out
+    if isinstance(content, dict):
+        content = [content]
+    for block in content:
+        if isinstance(block, str):
+            if block.strip():
+                out.append(("text", None, block))
+            continue
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype in ("text", "input_text", "output_text"):
+            text = block.get("text") or ""
+            if text.strip():
+                out.append(("text", None, text))
+        elif btype == "thinking":
+            text = block.get("thinking") or ""
+            if text.strip():
+                out.append(("thinking", None, text))
+        elif btype == "tool_use":
+            out.append(
+                ("tool", block.get("name"), json.dumps(block.get("input") or {}))
+            )
+        elif btype == "tool_result":
+            inner = block.get("content")
+            text = ""
+            for kind, _n, body in blocks_to_events(inner):
+                if kind == "text":
+                    text += body
+            if not text and isinstance(inner, str):
+                text = inner
+            out.append(("result", None, text))
+        elif btype == "image":
+            out.append(("text", None, "[image]"))
+    return out
+
+
+# ---------------------------------------------------------------- Session
+
+
+class Session:
+    def __init__(self, source, sid, path, cwd=None, started=0.0, updated=0.0,
+                 title=None, extra=None):
+        self.source = source
+        self.sid = sid
+        self.path = path
+        self.cwd = cwd
+        self.started = started
+        self.updated = updated
+        self.title = title
+        self.extra = extra or {}
+        self._events = None
+
+    @property
+    def ref(self):
+        return f"{self.source}:{self.sid}"
+
+    def events(self):
+        """[{role, kind, name, text, ts}] in order."""
+        if self._events is None:
+            self._events = LOADERS[self.source](self)
+        return self._events
+
+    def summary_line(self):
+        title = self.title or first_user_line(self) or "(no prompt)"
+        return (
+            f"{self.source:<7} {self.sid[:36]:<36} {ts_fmt(self.updated):<17}"
+            f" {age(self.updated):>8}  {(self.cwd or '?'):<28} {clip_line(title, 70)}"
+        )
+
+
+def clip_line(text, limit):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+# Harness-injected context that is never a human instruction: drop outright.
+DROP_PREFIXES = (
+    "# agents.md", "<instructions", "# environment", "## memory",
+    "<environment_context", "<user_instructions", "# claude.md",
+    "you are codex", "<project_doc", "# memory index",
+)
+# Wrappers the human's words are buried inside: unwrap, keep what is left.
+UNWRAP_MARKERS = (
+    "caveat:", "<local-command", "<command-name", "<system-reminder",
+    "<user-prompt-submit-hook",
+)
+
+
+def classify_user(text):
+    """-> 'drop' | 'unwrap' | 'keep'"""
+    stripped = (text or "").strip()
+    if not stripped:
+        return "drop"
+    low = stripped.lower()
+    if any(low.startswith(p) for p in DROP_PREFIXES):
+        return "drop"
+    if any(low.startswith(p) for p in UNWRAP_MARKERS):
+        return "unwrap"
+    if "<system-reminder>" in stripped or "<local-command" in stripped:
+        return "unwrap"
+    return "keep"
+
+
+def real_user_text(text):
+    """Strip wrapper tags so the human's actual words survive."""
+    text = re.sub(r"<(system-reminder|local-command-caveat|command-message|"
+                  r"command-args|local-command-stdout)>.*?</\1>", "",
+                  text or "", flags=re.S | re.I)
+    text = re.sub(r"</?[a-z-]+>", "", text)
+    return text.strip()
+
+
+def user_prompt(text):
+    """The human's words, or None if this turn carried none."""
+    verdict = classify_user(text)
+    if verdict == "drop":
+        return None
+    if verdict == "keep":
+        return text.strip()
+    cleaned = real_user_text(text)
+    return cleaned if len(cleaned) >= 12 else None
+
+
+def first_user_line(session):
+    for event in session.events():
+        if event["role"] != "user" or event["kind"] != "text":
+            continue
+        prompt = user_prompt(event["text"])
+        if prompt:
+            return clip_line(prompt, 200)
+    return None
+
+
+# ---------------------------------------------------------------- loaders
+
+
+def load_claude(session):
+    events = []
+    for rec in iter_jsonl(session.path):
+        rtype = rec.get("type")
+        if rtype not in ("user", "assistant", "system"):
+            continue
+        ts = ts_epoch(rec.get("timestamp"))
+        if rtype == "system":
+            text = rec.get("content") or rec.get("message") or ""
+            if isinstance(text, str) and text.strip():
+                events.append(dict(role="system", kind="text", name=None,
+                                   text=text, ts=ts))
+            continue
+        message = rec.get("message")
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role") or rtype
+        for kind, name, text in blocks_to_events(message.get("content")):
+            events.append(dict(role=role, kind=kind, name=name, text=text, ts=ts))
+    return events
+
+
+def load_codex(session):
+    events = []
+    for rec in iter_jsonl(session.path):
+        payload = rec.get("payload") or {}
+        ts = ts_epoch(rec.get("timestamp"))
+        if rec.get("type") != "response_item":
+            continue
+        ptype = payload.get("type")
+        if ptype == "message":
+            role = payload.get("role") or "assistant"
+            for kind, name, text in blocks_to_events(payload.get("content")):
+                events.append(dict(role=role, kind=kind, name=name, text=text,
+                                   ts=ts))
+        elif ptype in ("function_call", "local_shell_call", "custom_tool_call"):
+            name = payload.get("name") or ptype
+            args = payload.get("arguments")
+            if args is None:
+                args = payload.get("input")
+            if args is None:
+                args = payload.get("action") or {}
+            events.append(dict(role="assistant", kind="tool", name=name,
+                               text=args if isinstance(args, str) else json.dumps(args),
+                               ts=ts))
+        elif ptype in ("function_call_output", "local_shell_call_output",
+                       "custom_tool_call_output"):
+            out = payload.get("output")
+            if isinstance(out, list):
+                out = "".join(t for k, _n, t in blocks_to_events(out)
+                              if k == "text")
+            elif isinstance(out, dict):
+                out = out.get("content") or json.dumps(out)
+            events.append(dict(role="tool", kind="result", name=None,
+                               text=str(out or ""), ts=ts))
+        elif ptype == "reasoning":
+            parts = payload.get("summary") or []
+            for part in parts:
+                text = part.get("text") if isinstance(part, dict) else str(part)
+                if text:
+                    events.append(dict(role="assistant", kind="thinking",
+                                       name=None, text=text, ts=ts))
+    return events
+
+
+def load_hermes(session):
+    events = []
+    con = hermes_conn()
+    if con is None:
+        return events
+    rows = con.execute(
+        "SELECT role, content, tool_name, tool_calls, timestamp FROM messages "
+        "WHERE session_id = ? ORDER BY id",
+        (session.sid,),
+    ).fetchall()
+    for role, content, tool_name, tool_calls, ts in rows:
+        role = role or "assistant"
+        if content:
+            parsed = None
+            if isinstance(content, str) and content.lstrip()[:1] in "[{":
+                try:
+                    parsed = json.loads(content)
+                except Exception:
+                    parsed = None
+            if parsed is not None and not isinstance(parsed, (int, float)):
+                got = blocks_to_events(parsed)
+                if got:
+                    for kind, name, text in got:
+                        events.append(dict(role=role, kind=kind, name=name,
+                                           text=text, ts=ts))
+                    continue
+            kind = "result" if role == "tool" else "text"
+            events.append(dict(role=role, kind=kind, name=tool_name,
+                               text=str(content), ts=ts))
+        if tool_calls:
+            try:
+                calls = json.loads(tool_calls)
+            except Exception:
+                calls = []
+            for call in calls if isinstance(calls, list) else []:
+                fn = (call or {}).get("function") or {}
+                events.append(dict(role="assistant", kind="tool",
+                                   name=fn.get("name") or call.get("name"),
+                                   text=str(fn.get("arguments") or ""), ts=ts))
+    return events
+
+
+LOADERS = {"claude": load_claude, "codex": load_codex, "hermes": load_hermes}
+
+
+_HERMES_CON = None
+
+
+def hermes_conn():
+    global _HERMES_CON
+    if _HERMES_CON is None:
+        if not HERMES_DB.exists():
+            return None
+        try:
+            _HERMES_CON = sqlite3.connect(f"file:{HERMES_DB}?mode=ro", uri=True,
+                                          timeout=5)
+        except Exception:
+            return None
+    return _HERMES_CON
+
+
+# ---------------------------------------------------------------- discovery
+
+
+def discover_claude(project):
+    out = []
+    if not CLAUDE_PROJECTS.is_dir():
+        return out
+    if project:
+        dirs = [CLAUDE_PROJECTS / project_slug(project)]
+    else:
+        dirs = [d for d in CLAUDE_PROJECTS.iterdir() if d.is_dir()]
+    for directory in dirs:
+        if not directory.is_dir():
+            continue
+        cwd = "/" + directory.name.strip("-").replace("-", "/") if directory.name.startswith("-") else directory.name
+        for path in directory.glob("*.jsonl"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_size == 0:
+                continue
+            out.append(Session("claude", path.stem, path, cwd=cwd,
+                               started=stat.st_ctime, updated=stat.st_mtime))
+    return out
+
+
+def discover_codex(project):
+    out = []
+    if not CODEX_SESSIONS.is_dir():
+        return out
+    for path in CODEX_SESSIONS.rglob("rollout-*.jsonl"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if stat.st_size == 0:
+            continue
+        sid, cwd = path.stem, None
+        with open(path, "r", errors="replace") as handle:
+            for line in handle:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    break
+                if rec.get("type") == "session_meta":
+                    payload = rec.get("payload") or {}
+                    sid = payload.get("session_id") or sid
+                    cwd = payload.get("cwd")
+                break
+        if project and cwd and not str(cwd).startswith(str(project)):
+            continue
+        out.append(Session("codex", sid, path, cwd=cwd, started=stat.st_ctime,
+                           updated=stat.st_mtime))
+    return out
+
+
+def discover_hermes(project):
+    out = []
+    con = hermes_conn()
+    if con is None:
+        return out
+    try:
+        rows = con.execute(
+            "SELECT id, cwd, started_at, COALESCE(last_activity_at, ended_at, "
+            "started_at), title, source, message_count FROM sessions "
+            "WHERE COALESCE(archived,0)=0 ORDER BY 4 DESC LIMIT 400"
+        ).fetchall()
+    except Exception:
+        return out
+    for sid, cwd, started, updated, title, src, count in rows:
+        if not count:
+            continue
+        if project and cwd and not str(cwd).startswith(str(project)):
+            continue
+        out.append(Session("hermes", sid, None, cwd=cwd, started=started or 0,
+                           updated=updated or 0, title=title,
+                           extra={"platform": src, "messages": count}))
+    return out
+
+
+DISCOVER = {"claude": discover_claude, "codex": discover_codex,
+            "hermes": discover_hermes}
+
+
+def discover(sources, project):
+    out = []
+    for source in sources:
+        out.extend(DISCOVER[source](project))
+    out.sort(key=lambda s: s.updated, reverse=True)
+    return out
+
+
+def resolve(ref, sources, project):
+    """'latest', 'codex:latest', an id or id prefix, or a file path."""
+    if ref and os.path.isfile(ref):
+        path = Path(ref)
+        source = "codex" if path.name.startswith("rollout-") else "claude"
+        stat = path.stat()
+        return Session(source, path.stem, path, started=stat.st_ctime,
+                       updated=stat.st_mtime)
+    if ref and ":" in ref:
+        head, tail = ref.split(":", 1)
+        if head in SOURCES:
+            sources, ref = [head], tail
+    candidates = discover(sources, project)
+    # the caller's own live session is never the one being resumed
+    own = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_SESSION_ID")
+    if own:
+        candidates = [s for s in candidates if s.sid != own]
+    if not ref or ref in ("latest", "last", "prev", "previous"):
+        index = 1 if ref in ("prev", "previous") else 0
+        return candidates[index] if len(candidates) > index else None
+    match = re.fullmatch(r"(?:latest|last)~(\d+)", ref or "")
+    if match:
+        index = int(match.group(1))
+        return candidates[index] if len(candidates) > index else None
+    for session in candidates:
+        if session.sid == ref:
+            return session
+    hits = [s for s in candidates if s.sid.startswith(ref) or ref in s.sid]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        sys.stderr.write("ambiguous ref, matches:\n")
+        for session in hits[:10]:
+            sys.stderr.write(f"  {session.ref}\n")
+        sys.exit(2)
+    # widen to all projects before giving up
+    if project:
+        return resolve(ref, sources, None)
+    return None
+
+
+# ---------------------------------------------------------------- rendering
+
+
+ROLE_TAG = {"user": "USER", "assistant": "ASSISTANT", "system": "SYSTEM",
+            "tool": "TOOL", "developer": "DEVELOPER"}
+
+FILE_TOOLS = {"Edit", "Write", "NotebookEdit", "Read", "MultiEdit",
+              "apply_patch", "str_replace_editor", "edit_file", "write_file"}
+SHELL_TOOLS = {"Bash", "shell", "local_shell", "run_command", "bash"}
+
+
+def tool_args(text):
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+# Codex wraps shell work in a JS snippet: tools.exec_command({cmd:"..."})
+EXEC_CMD_RE = re.compile(r'\bcmd\s*:\s*(["\'])(.*?)(?<!\\)\1', re.S)
+# Paths written by apply_patch / heredocs inside a shell command.
+PATCH_PATH_RE = re.compile(
+    r"^\s*(?:\*\*\*\s*(?:Add|Update|Delete) File:|>{1,2}\s*|tee\s+(?:-a\s+)?)"
+    r"([^\s'\"<>|]+)", re.M)
+
+
+def extract_shell(name, raw, data):
+    """Best-effort shell command text out of any of the three log dialects."""
+    cmd = data.get("command") or data.get("cmd") or data.get("script")
+    if isinstance(cmd, list):
+        parts = [str(c) for c in cmd]
+        if len(parts) >= 3 and parts[0] in ("bash", "sh", "zsh"):
+            return parts[-1]
+        return " ".join(parts)
+    if isinstance(cmd, str) and cmd:
+        return cmd
+    if isinstance(raw, str):
+        found = EXEC_CMD_RE.search(raw)
+        if found:
+            return found.group(2).encode().decode("unicode_escape", "replace")
+    return None
+
+
+def render_show(session, args):
+    lines = [header(session), ""]
+    for event in session.events():
+        role, kind = event["role"], event["kind"]
+        if kind == "thinking" and not args.thinking:
+            continue
+        if role in ("system", "developer") and not args.system:
+            continue
+        if kind == "result" and not args.tools:
+            continue
+        if kind == "tool" and not args.tools:
+            lines.append(f"[{ts_fmt(event['ts'])}] TOOL {event['name']}")
+            continue
+        tag = ROLE_TAG.get(role, role.upper())
+        if kind == "tool":
+            tag = f"TOOL_CALL {event['name']}"
+        elif kind == "result":
+            tag = "TOOL_RESULT"
+        elif kind == "thinking":
+            tag = f"{tag} (thinking)"
+        lines.append(f"\n[{ts_fmt(event['ts'])}] {tag}")
+        lines.append(clip(event["text"], args.chars))
+    return "\n".join(lines)
+
+
+def header(session):
+    bits = [
+        f"session : {session.ref}",
+        f"file    : {session.path or 'sqlite:' + str(HERMES_DB)}",
+        f"cwd     : {session.cwd or '?'}",
+        f"started : {ts_fmt(session.started)}",
+        f"updated : {ts_fmt(session.updated)}  ({age(session.updated)})",
+    ]
+    for key, value in (session.extra or {}).items():
+        bits.append(f"{key:<8}: {value}")
+    return "== " + session.ref + " ==\n" + "\n".join(bits)
+
+
+def render_resume(session, args):
+    events = session.events()
+    users, files, shells, assistant_text = [], [], [], []
+    for event in events:
+        role, kind, text = event["role"], event["kind"], event["text"]
+        if role == "user" and kind == "text":
+            prompt = user_prompt(text)
+            if prompt:
+                users.append(prompt)
+        elif role == "assistant" and kind == "text":
+            assistant_text.append(event)
+        elif kind == "tool":
+            name = event["name"] or ""
+            data = tool_args(text)
+            path = (data.get("file_path") or data.get("path")
+                    or data.get("notebook_path"))
+            if path and (name in FILE_TOOLS or "patch" in name.lower()):
+                files.append(("read" if name == "Read" else "write", str(path)))
+                continue
+            cmd = extract_shell(name, text, data)
+            if cmd:
+                shells.append(cmd)
+                for hit in PATCH_PATH_RE.findall(cmd):
+                    if "/" in hit or "." in hit:
+                        files.append(("write", hit))
+
+    written = [p for verb, p in files if verb == "write"]
+    read = [p for verb, p in files if verb == "read"]
+    written = list(dict.fromkeys(written))
+    read = list(dict.fromkeys(read))
+
+    tail_text = ""
+    for event in reversed(events):
+        if event["role"] == "assistant" and event["kind"] == "text":
+            tail_text = event["text"]
+            break
+    ended = detect_end(events)
+
+    out = []
+    out.append("=" * 72)
+    out.append("HANDOFF BRIEF - resume this task where the previous agent stopped")
+    out.append("=" * 72)
+    out.append(header(session))
+    out.append(f"events  : {len(events)}   user turns: {len(users)}")
+    out.append(f"ended   : {ended}")
+    out.append("")
+    out.append("-" * 72)
+    out.append("THE TASK - every user instruction, in order, verbatim")
+    out.append("-" * 72)
+    keep = users if args.all_turns else users[: args.max_turns]
+    for i, text in enumerate(keep, 1):
+        out.append(f"\n[user {i}]")
+        out.append(clip(text.strip(), args.chars))
+    if len(users) > len(keep):
+        out.append(f"\n... {len(users) - len(keep)} more user turns "
+                   f"(--all-turns to include)")
+
+    if written:
+        out.append("")
+        out.append("-" * 72)
+        out.append(f"FILES CREATED / MODIFIED ({len(written)})")
+        out.append("-" * 72)
+        out.extend("  " + p for p in written[-40:])
+    if read:
+        out.append("")
+        out.append(f"FILES READ ({len(read)}): " +
+                   ", ".join(read[-25:]))
+    if shells:
+        out.append("")
+        out.append("-" * 72)
+        out.append(f"COMMANDS RUN (last {min(len(shells), 25)} of {len(shells)})")
+        out.append("-" * 72)
+        for cmd in shells[-25:]:
+            out.append("  $ " + clip_line(cmd, 200))
+
+    out.append("")
+    out.append("-" * 72)
+    out.append("WHERE IT LEFT OFF - final assistant turns")
+    out.append("-" * 72)
+    for event in assistant_text[-args.tail:]:
+        out.append("")
+        out.append(clip(event["text"].strip(), args.chars))
+    if not assistant_text:
+        out.append("(no assistant text - session died before answering)")
+
+    out.append("")
+    out.append("-" * 72)
+    out.append("NEXT")
+    out.append("-" * 72)
+    out.append(f"Continue the task above from `{session.cwd or DEFAULT_PROJECT}`.")
+    out.append("Re-verify state on disk before acting; the brief is a record of")
+    out.append("what was attempted, not proof it landed.")
+    if tail_text:
+        out.append(f"Last words: {clip_line(tail_text, 300)}")
+    out.append(f"Full transcript: agentlog show {session.ref}")
+    return "\n".join(out)
+
+
+def detect_end(events):
+    for event in reversed(events[-12:]):
+        text = event["text"] or ""
+        if RATE_LIMIT_RE.search(text[:2000]):
+            return f"likely RATE LIMIT / quota stop -> {clip_line(text, 160)}"
+    if not events:
+        return "empty"
+    last = events[-1]
+    if last["kind"] == "tool":
+        return f"mid-tool-call ({last['name']}) - cut off during work"
+    if last["role"] == "user":
+        return "ended on a user message - agent never replied"
+    return "ended on an assistant reply (may be complete)"
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_list(args):
+    sessions = discover(args.sources, args.project)
+    if args.since_hours:
+        cutoff = time.time() - args.since_hours * 3600
+        sessions = [s for s in sessions if s.updated >= cutoff]
+    sessions = sessions[: args.limit]
+    if args.json:
+        print(json.dumps([dict(source=s.source, id=s.sid,
+                               path=str(s.path) if s.path else None,
+                               cwd=s.cwd, updated=s.updated,
+                               updated_h=ts_fmt(s.updated),
+                               title=s.title or first_user_line(s))
+                          for s in sessions], indent=2))
+        return
+    print(f"{'SOURCE':<7} {'ID':<36} {'UPDATED':<17} {'AGE':>8}  "
+          f"{'CWD':<28} FIRST PROMPT")
+    for session in sessions:
+        print(session.summary_line())
+    if not sessions:
+        print("(no sessions found)")
+
+
+def cmd_show(args):
+    session = resolve(args.ref, args.sources, args.project)
+    if not session:
+        sys.exit(f"no session matching {args.ref!r}")
+    emit(render_show(session, args), args)
+
+
+def cmd_resume(args):
+    session = resolve(args.ref, args.sources, args.project)
+    if not session:
+        sys.exit(f"no session matching {args.ref!r}")
+    emit(render_resume(session, args), args)
+
+
+def cmd_search(args):
+    pattern = re.compile(args.query, re.I if not args.case else 0)
+    sessions = discover(args.sources, args.project)
+    if args.since_hours:
+        cutoff = time.time() - args.since_hours * 3600
+        sessions = [s for s in sessions if s.updated >= cutoff]
+    hits, scanned = 0, 0
+    for session in sessions[: args.scan]:
+        scanned += 1
+        matches = []
+        for event in session.events():
+            text = event["text"] or ""
+            if event["kind"] == "result" and not args.tools:
+                continue
+            match = pattern.search(text)
+            if match:
+                start = max(0, match.start() - 90)
+                snippet = text[start: match.end() + 90]
+                matches.append((event["role"], event["kind"],
+                                clip_line(snippet, 220)))
+                if len(matches) >= args.per_session:
+                    break
+        if matches:
+            hits += 1
+            print(f"\n\033[1m{session.ref}\033[0m  {ts_fmt(session.updated)} "
+                  f"({age(session.updated)})  {session.cwd or ''}")
+            for role, kind, snippet in matches:
+                print(f"    [{role}/{kind}] {snippet}")
+            if hits >= args.limit:
+                break
+    print(f"\n{hits} session(s) matched, {scanned} scanned. "
+          f"Resume one with: agentlog resume <source:id>")
+
+
+def emit(text, args):
+    if args.out:
+        Path(args.out).write_text(text)
+        print(f"wrote {args.out} ({len(text)} chars)")
+    else:
+        print(text)
+
+
+# ---------------------------------------------------------------- cli
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="agentlog",
+        description="Read and search Claude Code / Codex / Hermes session logs "
+                    "so another agent can resume an interrupted task.")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--source", default="all",
+                        help="claude|codex|hermes|all (default all)")
+    common.add_argument("--project", default=DEFAULT_PROJECT,
+                        help=f"filter by cwd prefix (default {DEFAULT_PROJECT}); "
+                             "'any' for no filter")
+    common.add_argument("--chars", type=int, default=4000,
+                        help="max chars per message block (default 4000)")
+    common.add_argument("--out", help="write output to a file instead of stdout")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    def add(name, help_text):
+        return sub.add_parser(name, help=help_text, parents=[common])
+
+    p = add("list", "list recent sessions, newest first")
+    p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--since-hours", type=float, default=0)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = add("resume", "handoff brief for continuing a session")
+    p.add_argument("ref", nargs="?", default="latest")
+    p.add_argument("--tail", type=int, default=3,
+                   help="assistant turns of tail context (default 3)")
+    p.add_argument("--max-turns", type=int, default=25,
+                   help="max user turns to include (default 25)")
+    p.add_argument("--all-turns", action="store_true")
+    p.set_defaults(func=cmd_resume)
+
+    p = add("show", "full readable transcript")
+    p.add_argument("ref", nargs="?", default="latest")
+    p.add_argument("--tools", action="store_true", help="include tool bodies")
+    p.add_argument("--thinking", action="store_true")
+    p.add_argument("--system", action="store_true")
+    p.set_defaults(func=cmd_show)
+
+    p = add("search", "regex search across sessions")
+    p.add_argument("query")
+    p.add_argument("--limit", type=int, default=15, help="max matching sessions")
+    p.add_argument("--scan", type=int, default=150, help="max sessions to scan")
+    p.add_argument("--per-session", type=int, default=3)
+    p.add_argument("--since-hours", type=float, default=0)
+    p.add_argument("--case", action="store_true")
+    p.add_argument("--tools", action="store_true", help="also search tool output")
+    p.set_defaults(func=cmd_search)
+
+    args = parser.parse_args()
+    args.sources = list(SOURCES) if args.source == "all" else \
+        [s.strip() for s in args.source.split(",") if s.strip() in SOURCES]
+    if not args.sources:
+        sys.exit(f"--source must be one of {SOURCES} or 'all'")
+    if args.project in ("any", "all", ""):
+        args.project = None
+    args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        pass
+    except KeyboardInterrupt:
+        sys.exit(130)
