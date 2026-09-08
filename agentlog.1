@@ -239,10 +239,10 @@ Ambiguous ref; the candidates are listed on stderr.
 .B 130
 Interrupted.
 .SH LIMITATIONS
-Codex builds a small number of shell commands in a JavaScript variable rather
-than a string literal (about 0.6% of calls, measured). Those do not appear in
-the COMMANDS RUN section, since recovering them would require parsing the
-snippet.
+Codex builds a small number of shell commands as arrays or computed values
+inside the JavaScript snippet rather than as a literal string. Measured over
+12,522 exec calls, 1.7% are not recovered and so do not appear in the
+COMMANDS RUN section; extracting them would require evaluating the snippet.
 .PP
 A Hermes session blocked by a provider limit is not detectable unless its final
 message is error\-shaped, which is why such sessions report

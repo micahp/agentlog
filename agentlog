@@ -18,7 +18,7 @@ import re
 import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HOME = Path(os.path.expanduser("~"))
@@ -566,6 +566,9 @@ def tool_args(text):
 # and are roughly half the calls each: {cmd:"..."} and {"cmd":"..."}.
 EXEC_CMD_RE = re.compile(r'["\']?\bcmd["\']?\s*:\s*(["\'])(.*?)(?<!\\)\1', re.S)
 # Paths written by apply_patch / heredocs inside a shell command.
+# Some calls build the command in a backtick template first: const cmd = `...`
+EXEC_TEMPLATE_RE = re.compile(
+    r"\b(?:const|let|var)\s+(?:cmd|command|script)\s*=\s*`([^`]*)`", re.S)
 PATCH_PATH_RE = re.compile(
     r"^\s*(?:\*\*\*\s*(?:Add|Update|Delete) File:|>{1,2}\s*|tee\s+(?:-a\s+)?)"
     r"([^\s'\"<>|]+)", re.M)
@@ -585,6 +588,9 @@ def extract_shell(name, raw, data):
         found = EXEC_CMD_RE.search(raw)
         if found:
             return unescape(found.group(2))
+        found = EXEC_TEMPLATE_RE.search(raw)
+        if found:
+            return found.group(1).strip()
     return None
 
 
@@ -768,12 +774,19 @@ def codex_status(session):
             error = payload.get("error")
             if payload.get("type") == "task_complete":
                 # a later clean task_complete means the limit was survived
-                last_error = error if isinstance(error, dict) else None
+                last_error = (error, ts_epoch(rec.get("timestamp"))) \
+                    if isinstance(error, dict) else None
     if last_error:
-        code = last_error.get("codex_error_info")
-        message = last_error.get("message") or ""
+        error, error_at = last_error
+        code = error.get("codex_error_info")
+        message = error.get("message") or ""
         info["message"] = message
         if code == "usage_limit_exceeded" or RATE_LIMIT_RE.search(message):
+            # the error names the reset for THIS limit; the last rate_limits
+            # block may describe a later, unrelated window
+            named = parse_reset(message, error_at)
+            if named:
+                info["resets_at"] = named
             resets = info["resets_at"]
             expired = bool(resets) and resets < time.time()
             info["state"] = "expired" if expired else "rate_limited"
@@ -784,6 +797,38 @@ def codex_status(session):
             info["state"] = "error"
             info["detail"] = clip_line(message, 90)
     return info
+
+
+RESET_AT_RE = re.compile(r"try again at ([^.]+?)\.", re.I)
+
+
+def parse_reset(message, error_epoch):
+    """Absolute reset time named by the error itself.
+
+    Codex writes either a bare local time ("3:07 PM") or a full date
+    ("Sep 4th, 2026 12:02 AM"). The bare form is anchored to the day the error
+    happened, rolling forward if that lands in the past.
+    """
+    found = RESET_AT_RE.search(message or "")
+    if not found:
+        return None
+    text = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", found.group(1).strip(), flags=re.I)
+    try:
+        return datetime.strptime(text, "%b %d, %Y %I:%M %p").timestamp()
+    except ValueError:
+        pass
+    try:
+        clock = datetime.strptime(text, "%I:%M %p")
+    except ValueError:
+        return None
+    if not error_epoch:
+        return None
+    base = datetime.fromtimestamp(error_epoch)
+    reset = base.replace(hour=clock.hour, minute=clock.minute, second=0,
+                         microsecond=0)
+    if reset < base:
+        reset += timedelta(days=1)
+    return reset.timestamp()
 
 
 def until(epoch):
