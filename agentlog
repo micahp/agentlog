@@ -781,26 +781,83 @@ def codex_status(session):
     return info
 
 
-def text_status(session):
-    """Fallback for logs with no structured error record: read the last turn."""
-    info = {"state": "ok", "detail": "", "resets_at": None, "primary": None,
+def blank_status():
+    return {"state": "ok", "detail": "", "resets_at": None, "primary": None,
             "secondary": None, "message": ""}
+
+
+# An agent REPORTING a rate limit is prose; an agent STOPPED by one is an error
+# message that starts this way. Only the second is a rate limit.
+ERROR_SHAPE_RE = re.compile(
+    r"^(?:API Error:|You've hit your|Claude AI usage limit reached|"
+    r"Rate limit(?:ed| reached| exceeded)|Request timed out|"
+    r"Error: \d{3}|\d{3} \{)", re.I)
+LIMIT_KIND_RE = re.compile(
+    r"usage limit|spend limit|rate.?limit|\b429\b|\b402\b|credits|quota", re.I)
+
+
+def classify_error_message(info, message):
+    """Set state/detail from a message already known to be a terminal error."""
+    info["message"] = message
+    if LIMIT_KIND_RE.search(message):
+        resets = info["resets_at"]
+        expired = bool(resets) and resets < time.time()
+        info["state"] = "expired" if expired else "rate_limited"
+        match = re.search(r"(?:try again at|resets? at) ([^.·|]+)", message, re.I)
+        info["detail"] = ("resets " + match.group(1).strip()) if match \
+            else clip_line(message, 90)
+    else:
+        info["state"] = "error"
+        info["detail"] = clip_line(message, 90)
+    return info
+
+
+def claude_status(session):
+    """Claude Code marks a terminal API failure with isApiErrorMessage: true.
+
+    An error only counts if nothing succeeded after it; otherwise the session
+    recovered and kept working.
+    """
+    info = blank_status()
+    last_error = None
+    for rec in iter_jsonl(session.path):
+        if rec.get("type") != "assistant":
+            continue
+        message = rec.get("message")
+        if not isinstance(message, dict):
+            continue
+        text = "".join(t for k, _n, t in blocks_to_events(message.get("content"))
+                       if k == "text").strip()
+        if rec.get("isApiErrorMessage"):
+            last_error = text
+        elif text:
+            last_error = None  # a real reply landed after the error
+    if last_error:
+        classify_error_message(info, last_error)
+    return info
+
+
+def hermes_status(session):
+    """Hermes records no structured rate-limit state, so require an error-shaped
+    final message rather than inferring from prose."""
+    info = blank_status()
     events = session.events()
-    for event in reversed(events[-4:]):
-        if event["kind"] != "text" or event["role"] not in ("assistant", "system"):
+    for event in reversed(events):
+        if event["kind"] != "text" or event["role"] != "assistant":
             continue
         text = (event["text"] or "").strip()
-        if RATE_LIMIT_RE.search(text[:400]):
-            info["state"] = "rate_limited"
-            info["detail"] = clip_line(text, 90)
+        if ERROR_SHAPE_RE.match(text):
+            classify_error_message(info, text)
         break
     return info
 
 
+STATUS = {"codex": codex_status, "claude": claude_status,
+          "hermes": hermes_status}
+
+
 def session_status(session):
-    if session.source == "codex":
-        return codex_status(session)
-    return text_status(session)
+    return STATUS[session.source](session)
 
 
 def detect_end(session, events):
