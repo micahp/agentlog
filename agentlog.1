@@ -1,0 +1,246 @@
+.TH AGENTLOG 1 "2026-09-08" "agentlog" "User Commands"
+.SH NAME
+agentlog \- read and search Claude Code, Codex, and Hermes session logs
+.SH SYNOPSIS
+.B agentlog
+.I command
+.RI [ ref ]
+.RI [ options ]
+.SH DESCRIPTION
+.B agentlog
+reads the session transcripts of three coding agents through one interface.
+Its purpose is handoff: when an agent stops mid\-task on a rate limit or a
+crash, the work is stranded in a transcript no other agent can read.
+.B agentlog resume
+turns that transcript into a brief another agent can act on, carrying the
+user's instructions verbatim, the files touched, the commands run, and how the
+session ended.
+.PP
+The brief is a record of what was
+.I attempted,
+not proof that it landed. A resuming agent should re\-verify state on disk.
+.SH COMMANDS
+.TP
+.B list
+Recent sessions, newest first, with the first real prompt of each. Harness
+preamble (AGENTS.md, CLAUDE.md, system reminders, slash\-command echoes) is
+stripped so the column shows what the human actually asked.
+.TP
+.B status
+Which recent sessions are rate limited. Checks the 5 most recent by default.
+See
+.B RATE LIMIT DETECTION
+below.
+.TP
+.BR resume " [" \fIref\fR "]"
+Print a handoff brief for a session. Sections: the task (every user
+instruction, in order), files created or modified, files read, the last 25
+commands run, the final assistant turns, and a NEXT block.
+.TP
+.BR show " [" \fIref\fR "]"
+Full readable transcript. Tool bodies, thinking, and system messages are
+omitted unless requested.
+.TP
+.BI search " regex"
+Case\-insensitive regex search across sessions, printing the matching session
+refs with context. Fast: a 200\-session scan takes about 0.2s.
+.SH SESSION REFS
+A
+.I ref
+is any of:
+.TP
+.B latest
+The newest session. The caller's own live session is excluded, so this is safe
+to run from inside an agent.
+.TP
+.BR prev ", " latest~\fIN\fR
+The session before the newest, or N back.
+.TP
+.I id
+A full session id, or any unambiguous prefix of one. An ambiguous prefix lists
+the matches and exits 2.
+.TP
+.IB source : id
+Restrict to one source, as in
+.BR codex:01a08 .
+.I source
+alone also works, as in
+.BR codex:latest .
+.TP
+.I path
+A path to a log file, read directly.
+.SH OPTIONS
+These apply to every command and must follow the command name.
+.TP
+.BI \-\-source " name"
+.BR claude ", " codex ", " hermes ", or " all
+(default). Comma\-separated lists are accepted.
+.TP
+.BI \-\-project " path"
+Only sessions whose working directory is under
+.I path
+(default
+.BR /root ).
+Use
+.B any
+for no filter. This is a prefix match for all three sources, so
+.B /root
+includes
+.BR /root/prediction-market-trading .
+.TP
+.BI \-\-chars " n"
+Maximum characters per message block (default 4000). 0 disables truncation.
+.TP
+.BI \-\-out " file"
+Write to
+.I file
+instead of stdout, creating parent directories as needed.
+.PP
+Command\-specific options:
+.TP
+.BR list " " \-\-limit " \fIn\fR, " \-\-since\-hours " \fIn\fR, " \-\-json
+.TP
+.BR status " " \-n ", " \-\-limit " \fIn\fR, " \-\-json
+.TP
+.BR resume " " \-\-tail " \fIn\fR"
+Assistant turns of closing context (default 3; 0 for none).
+.TP
+.BR resume " " \-\-max\-turns " \fIn\fR, " \-\-all\-turns
+Cap on user turns included (default 25).
+.TP
+.BR resume " " \-y ", " \-\-yes
+Skip the confirmation described under
+.BR "RATE LIMIT DETECTION" .
+.TP
+.BR show " " \-\-tools ", " \-\-thinking ", " \-\-system
+Include tool call bodies and results, reasoning, and system messages.
+.TP
+.BR search " " \-\-limit " \fIn\fR, " \-\-scan " \fIn\fR, " \-\-per\-session " \fIn\fR, " \-\-case ", " \-\-tools
+.SH RATE LIMIT DETECTION
+Detection is structural. An agent that
+.I mentions
+a rate limit in prose is not an agent
+.I stopped
+by one, and grepping text for the phrase produces false positives.
+.TP
+.B codex
+Ground truth is an
+.B event_msg/task_complete
+record carrying
+.BR error.codex_error_info " = " usage_limit_exceeded .
+Every
+.B token_count
+record also carries a
+.B rate_limits
+block with
+.B used_percent
+and
+.B resets_at
+for a 5\-hour primary window and a weekly secondary window, which is where the
+usage percentages come from.
+.TP
+.B claude
+Claude Code marks a terminal API failure with
+.B isApiErrorMessage
+on the assistant record. The error only counts when no reply landed after it,
+so a session that hit a 529 and kept working reads
+.BR ok .
+.TP
+.B hermes
+Records no such state. A final message must be error\-shaped to count; prose is
+never inferred from.
+.PP
+Three states are reported.
+.B RATE LIMITED
+means blocked now, with a countdown to the reset.
+.B was limited
+means the window has already reopened, so the original agent can likely just
+continue and a handoff may be wasted work; in this case
+.B resume
+prints the notice and asks before producing a brief. The prompt appears only on
+a terminal, so a non\-interactive caller is warned and proceeds rather than
+hanging.
+.B ERROR
+is a terminal failure that is not a limit.
+.SH FILES
+.TP
+.I ~/.claude/projects/<slug>/<uuid>.jsonl
+Claude Code transcripts. The directory name is a lossy slug; the working
+directory is read from the records themselves.
+.TP
+.I ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+Codex rollouts.
+.TP
+.I ~/.hermes/state.db
+Hermes sessions and messages tables, opened read\-only.
+.SH EXAMPLES
+.PP
+Check whether anything is blocked before starting work:
+.PP
+.RS
+.EX
+agentlog status
+.EE
+.RE
+.PP
+Hand a stranded task to another agent:
+.PP
+.RS
+.EX
+agentlog resume codex:01a0814e \-\-out /tmp/handoff.txt
+.EE
+.RE
+.PP
+From inside an agent, pick up whatever died before it:
+.PP
+.RS
+.EX
+agentlog resume prev
+.EE
+.RE
+.PP
+Find where a topic was last discussed, across all agents and projects:
+.PP
+.RS
+.EX
+agentlog search "published_roster" \-\-project any
+.EE
+.RE
+.PP
+Machine\-readable status for a script:
+.PP
+.RS
+.EX
+agentlog status \-n 10 \-\-json
+.EE
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+No session matched the ref, or bad arguments.
+.TP
+.B 2
+Ambiguous ref; the candidates are listed on stderr.
+.TP
+.B 130
+Interrupted.
+.SH LIMITATIONS
+Codex builds a small number of shell commands in a JavaScript variable rather
+than a string literal (about 0.6% of calls, measured). Those do not appear in
+the COMMANDS RUN section, since recovering them would require parsing the
+snippet.
+.PP
+Hermes has no structured rate\-limit state, so a Hermes session blocked by a
+provider limit may read
+.B ok
+unless its final message is error\-shaped.
+.PP
+Colour is emitted only to a terminal, so piped output is clean for another
+agent to consume.
+.SH SEE ALSO
+The source is a single self\-contained Python script at
+.IR /root/agentlog/agentlog ,
+tracked in git.
