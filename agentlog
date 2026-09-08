@@ -786,6 +786,22 @@ def codex_status(session):
     return info
 
 
+def until(epoch):
+    """How long until a future timestamp."""
+    delta = max(0, epoch - time.time())
+    if delta < 3600:
+        return f"{int(delta // 60)}m"
+    return f"{int(delta // 3600)}h {int((delta % 3600) // 60)}m"
+
+
+def expired_note(info):
+    """A limit whose window has already reopened is not a live blocker."""
+    resets = info.get("resets_at")
+    when = f"{ts_fmt(resets)} ({age(resets)})" if resets else "an earlier time"
+    return (f"window already reset at {when} - that agent can likely run again, "
+            f"so a handoff may be unnecessary")
+
+
 def blank_status():
     return {"state": "ok", "detail": "", "resets_at": None, "primary": None,
             "secondary": None, "message": ""}
@@ -945,10 +961,15 @@ def cmd_status(args):
                 usage += f" / {secondary['used_percent']:.0f}% of weekly"
         print(f"{mark}{label:<13}{color(chr(27)+'[0m')} {session.ref:<45} {age(session.updated):>8}"
               f"  {(session.cwd or '?')}{usage}")
-        if info["detail"]:
+        # the detail's reset time came from the error text and is stale once the
+        # window has turned over; expired_note carries the current reading
+        if info["detail"] and info["state"] != "expired":
             print(f"              {info['detail']}")
         if info["resets_at"] and info["state"] == "rate_limited":
-            print(f"              window resets {ts_fmt(info['resets_at'])}")
+            print(f"              window resets {ts_fmt(info['resets_at'])}"
+                  f" (in {until(info['resets_at'])})")
+        elif info["state"] == "expired":
+            print(f"              {expired_note(info)}")
 
     print()
     if limited:
@@ -971,7 +992,30 @@ def cmd_resume(args):
     session = resolve(args.ref, args.sources, args.project)
     if not session:
         sys.exit(f"no session matching {args.ref!r}")
+    if not confirm_expired(session, args):
+        return
     emit(render_resume(session, args), args)
+
+
+def confirm_expired(session, args):
+    """A session blocked by a limit that has since reset probably does not need
+    handing off. Say so, and let a human stop here."""
+    info = session_status(session)
+    if info["state"] != "expired" or args.yes:
+        return True
+    print(f"NOTE: {session.ref} stopped on a rate limit, but its "
+          f"{expired_note(info)}.", file=sys.stderr)
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        # never block a non-interactive caller; the note above is the warning
+        return True
+    try:
+        answer = input("Still produce the handoff brief? [y/N] ").strip().lower()
+    except EOFError:
+        return True
+    if answer in ("y", "yes"):
+        return True
+    print("stopped; rerun with --yes to skip this check", file=sys.stderr)
+    return False
 
 
 def cmd_search(args):
@@ -1060,6 +1104,8 @@ def main():
     p.add_argument("--max-turns", type=int, default=25,
                    help="max user turns to include (default 25)")
     p.add_argument("--all-turns", action="store_true")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="skip the prompt when the limit window already reset")
     p.set_defaults(func=cmd_resume)
 
     p = add("show", "full readable transcript")
