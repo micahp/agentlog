@@ -408,12 +408,13 @@ def discover_claude(project):
     out = []
     if not CLAUDE_PROJECTS.is_dir():
         return out
-    if project:
-        dirs = [CLAUDE_PROJECTS / project_slug(project)]
-    else:
-        dirs = [d for d in CLAUDE_PROJECTS.iterdir() if d.is_dir()]
-    for directory in dirs:
+    # --project is a cwd PREFIX for codex and hermes; it has to mean the same
+    # here, so /root must also pick up /root/legendarypicks and friends.
+    slug = project_slug(project) if project else None
+    for directory in CLAUDE_PROJECTS.iterdir():
         if not directory.is_dir():
+            continue
+        if slug and not directory.name.startswith(slug):
             continue
         for path in directory.glob("*.jsonl"):
             try:
@@ -422,7 +423,10 @@ def discover_claude(project):
                 continue
             if stat.st_size == 0:
                 continue
-            out.append(Session("claude", path.stem, path, cwd=claude_cwd(path),
+            cwd = claude_cwd(path)
+            if project and cwd and not str(cwd).startswith(str(project)):
+                continue
+            out.append(Session("claude", path.stem, path, cwd=cwd,
                                started=stat.st_ctime, updated=stat.st_mtime))
     return out
 
@@ -553,8 +557,9 @@ def tool_args(text):
         return {}
 
 
-# Codex wraps shell work in a JS snippet: tools.exec_command({cmd:"..."})
-EXEC_CMD_RE = re.compile(r'\bcmd\s*:\s*(["\'])(.*?)(?<!\\)\1', re.S)
+# Codex wraps shell work in a JS snippet. Both key spellings occur in the logs
+# and are roughly half the calls each: {cmd:"..."} and {"cmd":"..."}.
+EXEC_CMD_RE = re.compile(r'["\']?\bcmd["\']?\s*:\s*(["\'])(.*?)(?<!\\)\1', re.S)
 # Paths written by apply_patch / heredocs inside a shell command.
 PATCH_PATH_RE = re.compile(
     r"^\s*(?:\*\*\*\s*(?:Add|Update|Delete) File:|>{1,2}\s*|tee\s+(?:-a\s+)?)"
@@ -574,8 +579,16 @@ def extract_shell(name, raw, data):
     if isinstance(raw, str):
         found = EXEC_CMD_RE.search(raw)
         if found:
-            return found.group(2).encode().decode("unicode_escape", "replace")
+            return unescape(found.group(2))
     return None
+
+
+def unescape(text):
+    """Undo JSON string escapes. unicode_escape would mangle non-ASCII."""
+    try:
+        return json.loads('"' + text.replace('\n', '\\n') + '"')
+    except Exception:
+        return text.replace('\\"', '"').replace("\\\\", "\\")
 
 
 def render_show(session, args):
@@ -652,7 +665,7 @@ def render_resume(session, args):
         if event["role"] == "assistant" and event["kind"] == "text":
             tail_text = event["text"]
             break
-    ended = detect_end(events)
+    ended = detect_end(session, events)
 
     out = []
     out.append("=" * 72)
@@ -695,7 +708,8 @@ def render_resume(session, args):
     out.append("-" * 72)
     out.append("WHERE IT LEFT OFF - final assistant turns")
     out.append("-" * 72)
-    for event in assistant_text[-args.tail:]:
+    # [-0:] is the whole list, not an empty one
+    for event in (assistant_text[-args.tail:] if args.tail > 0 else []):
         out.append("")
         out.append(clip(event["text"].strip(), args.chars))
     if not assistant_text:
@@ -789,11 +803,16 @@ def session_status(session):
     return text_status(session)
 
 
-def detect_end(events):
-    for event in reversed(events[-12:]):
-        text = event["text"] or ""
-        if RATE_LIMIT_RE.search(text[:2000]):
-            return f"likely RATE LIMIT / quota stop -> {clip_line(text, 160)}"
+def detect_end(session, events):
+    # Ask the same detector `status` uses. Grepping the tail for rate-limit
+    # prose flagged sessions that merely discussed one.
+    info = session_status(session)
+    if info["state"] == "rate_limited":
+        return f"RATE LIMITED - {info['detail'] or 'quota exhausted'}"
+    if info["state"] == "expired":
+        return f"hit a rate limit, window has since reset ({info['detail']})"
+    if info["state"] == "error":
+        return f"ended on an error - {info['detail']}"
     if not events:
         return "empty"
     last = events[-1]
