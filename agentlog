@@ -188,6 +188,11 @@ class Session:
         )
 
 
+def color(code):
+    """No escape codes when piped; the main consumer is another agent."""
+    return code if sys.stdout.isatty() else ""
+
+
 def clip_line(text, limit):
     text = " ".join(str(text).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -927,10 +932,10 @@ def cmd_status(args):
 
     for session, info in rows:
         mark, label = {
-            "rate_limited": ("\033[31m", "RATE LIMITED"),
-            "expired": ("\033[90m", "was limited"),
-            "error": ("\033[33m", "ERROR"),
-        }.get(info["state"], ("\033[32m", "ok"))
+            "rate_limited": (color("\033[31m"), "RATE LIMITED"),
+            "expired": (color("\033[90m"), "was limited"),
+            "error": (color("\033[33m"), "ERROR"),
+        }.get(info["state"], (color("\033[32m"), "ok"))
         usage = ""
         primary = info["primary"] or {}
         if primary.get("used_percent") is not None:
@@ -938,7 +943,7 @@ def cmd_status(args):
             secondary = info["secondary"] or {}
             if secondary.get("used_percent") is not None:
                 usage += f" / {secondary['used_percent']:.0f}% of weekly"
-        print(f"{mark}{label:<13}\033[0m {session.ref:<45} {age(session.updated):>8}"
+        print(f"{mark}{label:<13}{color(chr(27)+'[0m')} {session.ref:<45} {age(session.updated):>8}"
               f"  {(session.cwd or '?')}{usage}")
         if info["detail"]:
             print(f"              {info['detail']}")
@@ -993,7 +998,8 @@ def cmd_search(args):
                     break
         if matches:
             hits += 1
-            print(f"\n\033[1m{session.ref}\033[0m  {ts_fmt(session.updated)} "
+            print(f"\n{color(chr(27)+'[1m')}{session.ref}{color(chr(27)+'[0m')}"
+                  f"  {ts_fmt(session.updated)} "
                   f"({age(session.updated)})  {session.cwd or ''}")
             for role, kind, snippet in matches:
                 print(f"    [{role}/{kind}] {snippet}")
@@ -1005,8 +1011,10 @@ def cmd_search(args):
 
 def emit(text, args):
     if args.out:
-        Path(args.out).write_text(text)
-        print(f"wrote {args.out} ({len(text)} chars)")
+        path = Path(args.out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        print(f"wrote {path} ({len(text)} chars)")
     else:
         print(text)
 
