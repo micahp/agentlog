@@ -147,10 +147,18 @@ so a session that hit a 529 and kept working reads
 .BR ok .
 .TP
 .B hermes
-Records no such state. A final message must be error\-shaped to count; prose is
-never inferred from.
+Records no limit or error state anywhere: not on
+.BR sessions.end_reason ,
+not on
+.BR messages.finish_reason .
+An error\-shaped final message is the only available evidence, and its absence
+proves nothing, so a Hermes session reports
+.B unknown
+rather than a green
+.B ok
+that was never earned.
 .PP
-Three states are reported.
+Four states are reported.
 .B RATE LIMITED
 means blocked now, with a countdown to the reset.
 .B was limited
@@ -162,6 +170,9 @@ a terminal, so a non\-interactive caller is warned and proceeds rather than
 hanging.
 .B ERROR
 is a terminal failure that is not a limit.
+.B unknown
+means no signal was available; the summary line counts these separately so a
+run with unknowns is not mistaken for a clean bill.
 .SH FILES
 .TP
 .I ~/.claude/projects/<slug>/<uuid>.jsonl
@@ -233,10 +244,10 @@ than a string literal (about 0.6% of calls, measured). Those do not appear in
 the COMMANDS RUN section, since recovering them would require parsing the
 snippet.
 .PP
-Hermes has no structured rate\-limit state, so a Hermes session blocked by a
-provider limit may read
-.B ok
-unless its final message is error\-shaped.
+A Hermes session blocked by a provider limit is not detectable unless its final
+message is error\-shaped, which is why such sessions report
+.B unknown
+instead of a verdict.
 .PP
 Colour is emitted only to a terminal, so piped output is clean for another
 agent to consume.

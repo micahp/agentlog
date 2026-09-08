@@ -859,8 +859,10 @@ def claude_status(session):
 
 
 def hermes_status(session):
-    """Hermes records no structured rate-limit state, so require an error-shaped
-    final message rather than inferring from prose."""
+    """Hermes stores no limit or error state: not on sessions.end_reason, not on
+    messages.finish_reason, nowhere. An error-shaped final message is the only
+    evidence available, and its absence proves nothing, so say `unknown` rather
+    than report a green ok we did not earn."""
     info = blank_status()
     events = session.events()
     for event in reversed(events):
@@ -869,7 +871,11 @@ def hermes_status(session):
         text = (event["text"] or "").strip()
         if ERROR_SHAPE_RE.match(text):
             classify_error_message(info, text)
+            return info
         break
+    info["state"] = "unknown"
+    info["detail"] = ("hermes records no rate-limit state; only an error-shaped "
+                      "final message would show here")
     return info
 
 
@@ -951,6 +957,7 @@ def cmd_status(args):
             "rate_limited": (color("\033[31m"), "RATE LIMITED"),
             "expired": (color("\033[90m"), "was limited"),
             "error": (color("\033[33m"), "ERROR"),
+            "unknown": (color("\033[36m"), "unknown"),
         }.get(info["state"], (color("\033[32m"), "ok"))
         usage = ""
         primary = info["primary"] or {}
@@ -971,14 +978,18 @@ def cmd_status(args):
         elif info["state"] == "expired":
             print(f"              {expired_note(info)}")
 
+    unknown = sum(1 for _s, i in rows if i["state"] == "unknown")
+    caveat = (f" {unknown} could not be determined." if unknown else "")
     print()
     if limited:
-        print(f"{len(limited)} of {len(rows)} recent session(s) rate limited. "
-              f"Hand the work off with:")
+        print(f"{len(limited)} of {len(rows)} recent session(s) rate limited."
+              f"{caveat} Hand the work off with:")
         for session, _info in limited:
             print(f"    agentlog resume {session.ref}")
     else:
-        print(f"No rate limits in the last {len(rows)} sessions.")
+        checked = len(rows) - unknown
+        print(f"No rate limits in {checked} of the last {len(rows)} "
+              f"sessions.{caveat}")
 
 
 def cmd_show(args):
