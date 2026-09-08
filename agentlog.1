@@ -1,6 +1,6 @@
 .TH AGENTLOG 1 "2026-09-08" "agentlog" "User Commands"
 .SH NAME
-agentlog \- read and search Claude Code, Codex, and Hermes session logs
+agentlog \- read and search Claude Code and Codex session logs
 .SH SYNOPSIS
 .B agentlog
 .I command
@@ -8,7 +8,7 @@ agentlog \- read and search Claude Code, Codex, and Hermes session logs
 .RI [ options ]
 .SH DESCRIPTION
 .B agentlog
-reads the session transcripts of three coding agents through one interface.
+reads the session transcripts of both coding agents through one interface.
 Its purpose is handoff: when an agent stops mid\-task on a rate limit or a
 crash, the work is stranded in a transcript no other agent can read.
 .B agentlog resume
@@ -73,7 +73,7 @@ A path to a log file, read directly.
 These apply to every command and must follow the command name.
 .TP
 .BI \-\-source " name"
-.BR claude ", " codex ", " hermes ", or " all
+.BR claude ", " codex ", or " all
 (default). Comma\-separated lists are accepted.
 .TP
 .BI \-\-project " path"
@@ -83,7 +83,7 @@ Only sessions whose working directory is under
 .BR /root ).
 Use
 .B any
-for no filter. This is a prefix match for all three sources, so
+for no filter. This is a prefix match for both sources, so
 .B /root
 includes
 .BR /root/prediction-market-trading .
@@ -145,20 +145,8 @@ Claude Code marks a terminal API failure with
 on the assistant record. The error only counts when no reply landed after it,
 so a session that hit a 529 and kept working reads
 .BR ok .
-.TP
-.B hermes
-Records no limit or error state anywhere: not on
-.BR sessions.end_reason ,
-not on
-.BR messages.finish_reason .
-An error\-shaped final message is the only available evidence, and its absence
-proves nothing, so a Hermes session reports
-.B unknown
-rather than a green
-.B ok
-that was never earned.
 .PP
-Four states are reported.
+Three states are reported.
 .B RATE LIMITED
 means blocked now, with a countdown to the reset.
 .B was limited
@@ -170,9 +158,6 @@ a terminal, so a non\-interactive caller is warned and proceeds rather than
 hanging.
 .B ERROR
 is a terminal failure that is not a limit.
-.B unknown
-means no signal was available; the summary line counts these separately so a
-run with unknowns is not mistaken for a clean bill.
 .SH FILES
 .TP
 .I ~/.claude/projects/<slug>/<uuid>.jsonl
@@ -181,9 +166,6 @@ directory is read from the records themselves.
 .TP
 .I ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
 Codex rollouts.
-.TP
-.I ~/.hermes/state.db
-Hermes sessions and messages tables, opened read\-only.
 .SH EXAMPLES
 .PP
 Check whether anything is blocked before starting work:
@@ -244,10 +226,9 @@ inside the JavaScript snippet rather than as a literal string. Measured over
 12,522 exec calls, 1.7% are not recovered and so do not appear in the
 COMMANDS RUN section; extracting them would require evaluating the snippet.
 .PP
-A Hermes session blocked by a provider limit is not detectable unless its final
-message is error\-shaped, which is why such sessions report
-.B unknown
-instead of a verdict.
+Hermes is not supported. It records no limit or error state anywhere, so its
+sessions could not be reported on honestly and the source was removed rather
+than shipped half\-working.
 .PP
 Colour is emitted only to a terminal, so piped output is clean for another
 agent to consume.

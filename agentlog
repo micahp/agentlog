@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""agentlog - read/search session logs from Claude Code, Codex, and Hermes.
+"""agentlog - read/search session logs from Claude Code and Codex.
 
 Purpose: when one agent dies mid-task (rate limit, crash, context loss), another
 agent runs `agentlog resume latest` and gets a handoff brief with enough context
@@ -8,14 +8,12 @@ to continue the same work.
 Sources:
   claude  ~/.claude/projects/<slug>/<uuid>.jsonl
   codex   ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
-  hermes  ~/.hermes/state.db  (sessions + messages tables)
 """
 
 import argparse
 import json
 import os
 import re
-import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -24,10 +22,9 @@ from pathlib import Path
 HOME = Path(os.path.expanduser("~"))
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
-HERMES_DB = HOME / ".hermes" / "state.db"
 
 DEFAULT_PROJECT = "/root"
-SOURCES = ("claude", "codex", "hermes")
+SOURCES = ("claude", "codex")
 
 RATE_LIMIT_RE = re.compile(
     r"rate.?limit|429|usage limit|quota exceeded|too many requests|"
@@ -324,65 +321,7 @@ def load_codex(session):
     return events
 
 
-def load_hermes(session):
-    events = []
-    con = hermes_conn()
-    if con is None:
-        return events
-    rows = con.execute(
-        "SELECT role, content, tool_name, tool_calls, timestamp FROM messages "
-        "WHERE session_id = ? ORDER BY id",
-        (session.sid,),
-    ).fetchall()
-    for role, content, tool_name, tool_calls, ts in rows:
-        role = role or "assistant"
-        if content:
-            parsed = None
-            if isinstance(content, str) and content.lstrip()[:1] in "[{":
-                try:
-                    parsed = json.loads(content)
-                except Exception:
-                    parsed = None
-            if parsed is not None and not isinstance(parsed, (int, float)):
-                got = blocks_to_events(parsed)
-                if got:
-                    for kind, name, text in got:
-                        events.append(dict(role=role, kind=kind, name=name,
-                                           text=text, ts=ts))
-                    continue
-            kind = "result" if role == "tool" else "text"
-            events.append(dict(role=role, kind=kind, name=tool_name,
-                               text=str(content), ts=ts))
-        if tool_calls:
-            try:
-                calls = json.loads(tool_calls)
-            except Exception:
-                calls = []
-            for call in calls if isinstance(calls, list) else []:
-                fn = (call or {}).get("function") or {}
-                events.append(dict(role="assistant", kind="tool",
-                                   name=fn.get("name") or call.get("name"),
-                                   text=str(fn.get("arguments") or ""), ts=ts))
-    return events
-
-
-LOADERS = {"claude": load_claude, "codex": load_codex, "hermes": load_hermes}
-
-
-_HERMES_CON = None
-
-
-def hermes_conn():
-    global _HERMES_CON
-    if _HERMES_CON is None:
-        if not HERMES_DB.exists():
-            return None
-        try:
-            _HERMES_CON = sqlite3.connect(f"file:{HERMES_DB}?mode=ro", uri=True,
-                                          timeout=5)
-        except Exception:
-            return None
-    return _HERMES_CON
+LOADERS = {"claude": load_claude, "codex": load_codex}
 
 
 # ---------------------------------------------------------------- discovery
@@ -413,7 +352,7 @@ def discover_claude(project):
     out = []
     if not CLAUDE_PROJECTS.is_dir():
         return out
-    # --project is a cwd PREFIX for codex and hermes; it has to mean the same
+    # --project is a cwd PREFIX for codex; it has to mean the same
     # here, so /root must also pick up /root/legendarypicks and friends.
     slug = project_slug(project) if project else None
     for directory in CLAUDE_PROJECTS.iterdir():
@@ -466,32 +405,7 @@ def discover_codex(project):
     return out
 
 
-def discover_hermes(project):
-    out = []
-    con = hermes_conn()
-    if con is None:
-        return out
-    try:
-        rows = con.execute(
-            "SELECT id, cwd, started_at, COALESCE(last_activity_at, ended_at, "
-            "started_at), title, source, message_count FROM sessions "
-            "WHERE COALESCE(archived,0)=0 ORDER BY 4 DESC LIMIT 400"
-        ).fetchall()
-    except Exception:
-        return out
-    for sid, cwd, started, updated, title, src, count in rows:
-        if not count:
-            continue
-        if project and cwd and not str(cwd).startswith(str(project)):
-            continue
-        out.append(Session("hermes", sid, None, cwd=cwd, started=started or 0,
-                           updated=updated or 0, title=title,
-                           extra={"platform": src, "messages": count}))
-    return out
-
-
-DISCOVER = {"claude": discover_claude, "codex": discover_codex,
-            "hermes": discover_hermes}
+DISCOVER = {"claude": discover_claude, "codex": discover_codex}
 
 
 def discover(sources, project):
@@ -630,7 +544,7 @@ def render_show(session, args):
 def header(session):
     bits = [
         f"session : {session.ref}",
-        f"file    : {session.path or 'sqlite:' + str(HERMES_DB)}",
+        f"file    : {session.path}",
         f"cwd     : {session.cwd or '?'}",
         f"started : {ts_fmt(session.started)}",
         f"updated : {ts_fmt(session.updated)}  ({age(session.updated)})",
@@ -852,12 +766,6 @@ def blank_status():
             "secondary": None, "message": ""}
 
 
-# An agent REPORTING a rate limit is prose; an agent STOPPED by one is an error
-# message that starts this way. Only the second is a rate limit.
-ERROR_SHAPE_RE = re.compile(
-    r"^(?:API Error:|You've hit your|Claude AI usage limit reached|"
-    r"Rate limit(?:ed| reached| exceeded)|Request timed out|"
-    r"Error: \d{3}|\d{3} \{)", re.I)
 LIMIT_KIND_RE = re.compile(
     r"usage limit|spend limit|rate.?limit|\b429\b|\b402\b|credits|quota", re.I)
 
@@ -903,29 +811,7 @@ def claude_status(session):
     return info
 
 
-def hermes_status(session):
-    """Hermes stores no limit or error state: not on sessions.end_reason, not on
-    messages.finish_reason, nowhere. An error-shaped final message is the only
-    evidence available, and its absence proves nothing, so say `unknown` rather
-    than report a green ok we did not earn."""
-    info = blank_status()
-    events = session.events()
-    for event in reversed(events):
-        if event["kind"] != "text" or event["role"] != "assistant":
-            continue
-        text = (event["text"] or "").strip()
-        if ERROR_SHAPE_RE.match(text):
-            classify_error_message(info, text)
-            return info
-        break
-    info["state"] = "unknown"
-    info["detail"] = ("hermes records no rate-limit state; only an error-shaped "
-                      "final message would show here")
-    return info
-
-
-STATUS = {"codex": codex_status, "claude": claude_status,
-          "hermes": hermes_status}
+STATUS = {"codex": codex_status, "claude": claude_status}
 
 
 def session_status(session):
@@ -1002,7 +888,6 @@ def cmd_status(args):
             "rate_limited": (color("\033[31m"), "RATE LIMITED"),
             "expired": (color("\033[90m"), "was limited"),
             "error": (color("\033[33m"), "ERROR"),
-            "unknown": (color("\033[36m"), "unknown"),
         }.get(info["state"], (color("\033[32m"), "ok"))
         usage = ""
         primary = info["primary"] or {}
@@ -1023,18 +908,14 @@ def cmd_status(args):
         elif info["state"] == "expired":
             print(f"              {expired_note(info)}")
 
-    unknown = sum(1 for _s, i in rows if i["state"] == "unknown")
-    caveat = (f" {unknown} could not be determined." if unknown else "")
     print()
     if limited:
-        print(f"{len(limited)} of {len(rows)} recent session(s) rate limited."
-              f"{caveat} Hand the work off with:")
+        print(f"{len(limited)} of {len(rows)} recent session(s) rate limited. "
+              f"Hand the work off with:")
         for session, _info in limited:
             print(f"    agentlog resume {session.ref}")
     else:
-        checked = len(rows) - unknown
-        print(f"No rate limits in {checked} of the last {len(rows)} "
-              f"sessions.{caveat}")
+        print(f"No rate limits in the last {len(rows)} sessions.")
 
 
 def cmd_show(args):
@@ -1125,11 +1006,11 @@ def emit(text, args):
 def main():
     parser = argparse.ArgumentParser(
         prog="agentlog",
-        description="Read and search Claude Code / Codex / Hermes session logs "
+        description="Read and search Claude Code and Codex session logs "
                     "so another agent can resume an interrupted task.")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--source", default="all",
-                        help="claude|codex|hermes|all (default all)")
+                        help="claude|codex|all (default all)")
     common.add_argument("--project", default=DEFAULT_PROJECT,
                         help=f"filter by cwd prefix (default {DEFAULT_PROJECT}); "
                              "'any' for no filter")
