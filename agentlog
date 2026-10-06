@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""agentlog - read/search session logs from Claude Code and Codex.
+"""agentlog - read/search session logs from Claude Code, Codex and pi.
 
 Purpose: when one agent dies mid-task (rate limit, crash, context loss), another
 agent runs `agentlog resume latest` and gets a handoff brief with enough context
@@ -8,6 +8,7 @@ to continue the same work.
 Sources:
   claude  ~/.claude/projects/<slug>/<uuid>.jsonl
   codex   ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+  pi      ~/.pi/agent/sessions/<cwd slug>/<ISO time>_<uuid>.jsonl
 """
 
 import argparse
@@ -22,9 +23,10 @@ from pathlib import Path
 HOME = Path(os.path.expanduser("~"))
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
+PI_SESSIONS = HOME / ".pi" / "agent" / "sessions"
 
 DEFAULT_PROJECT = "/root"
-SOURCES = ("claude", "codex")
+SOURCES = ("claude", "codex", "pi")
 
 RATE_LIMIT_RE = re.compile(
     r"rate.?limit|429|usage limit|quota exceeded|too many requests|"
@@ -321,7 +323,47 @@ def load_codex(session):
     return events
 
 
-LOADERS = {"claude": load_claude, "codex": load_codex}
+def load_pi(session):
+    events = []
+    for rec in iter_jsonl(session.path):
+        if rec.get("type") != "message":
+            continue
+        ts = ts_epoch(rec.get("timestamp"))
+        message = rec.get("message")
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role == "toolResult":
+            for kind, _n, text in blocks_to_events(content):
+                events.append(dict(role="tool", kind="result", name=None,
+                                   text=text, ts=ts))
+            continue
+        blocks = content if isinstance(content, list) else [{"type": "text",
+                                                             "text": content}]
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text = block.get("text") or ""
+                if text.strip():
+                    events.append(dict(role=role, kind="text", name=None,
+                                       text=text, ts=ts))
+            elif btype == "thinking":
+                text = block.get("thinking") or ""
+                if text.strip():
+                    events.append(dict(role=role, kind="thinking", name=None,
+                                       text=text, ts=ts))
+            elif btype == "toolCall":
+                events.append(dict(role="assistant", kind="tool",
+                                   name=block.get("name"),
+                                   text=json.dumps(block.get("arguments") or {}),
+                                   ts=ts))
+    return events
+
+
+LOADERS = {"claude": load_claude, "codex": load_codex, "pi": load_pi}
 
 
 # ---------------------------------------------------------------- discovery
@@ -405,7 +447,36 @@ def discover_codex(project):
     return out
 
 
-DISCOVER = {"claude": discover_claude, "codex": discover_codex}
+def discover_pi(project):
+    out = []
+    if not PI_SESSIONS.is_dir():
+        return out
+    for path in PI_SESSIONS.rglob("*.jsonl"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if stat.st_size == 0:
+            continue
+        sid, cwd = path.stem, None
+        with open(path, "r", errors="replace") as handle:
+            for line in handle:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    break
+                if rec.get("type") == "session":
+                    sid = rec.get("id") or sid
+                    cwd = rec.get("cwd")
+                break
+        if project and cwd and not str(cwd).startswith(str(project)):
+            continue
+        out.append(Session("pi", sid, path, cwd=cwd, started=stat.st_ctime,
+                           updated=stat.st_mtime))
+    return out
+
+
+DISCOVER = {"claude": discover_claude, "codex": discover_codex, "pi": discover_pi}
 
 
 def discover(sources, project):
@@ -811,7 +882,18 @@ def claude_status(session):
     return info
 
 
-STATUS = {"codex": codex_status, "claude": claude_status}
+def pi_status(session):
+    """pi logs carry no terminal API-error marker.
+
+    toolResult.isError only marks failed tool calls (a session can recover from
+    those), and no other error shape has been observed in the four sessions on
+    disk. Rate limits and crashes for pi are therefore detected structurally by
+    detect_end from the event tail, not from a status record.
+    """
+    return blank_status()
+
+
+STATUS = {"codex": codex_status, "claude": claude_status, "pi": pi_status}
 
 
 def session_status(session):
@@ -1006,11 +1088,11 @@ def emit(text, args):
 def main():
     parser = argparse.ArgumentParser(
         prog="agentlog",
-        description="Read and search Claude Code and Codex session logs "
+        description="Read and search Claude Code, Codex and pi session logs "
                     "so another agent can resume an interrupted task.")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--source", default="all",
-                        help="claude|codex|all (default all)")
+                        help="claude|codex|pi|all (default all)")
     common.add_argument("--project", default=DEFAULT_PROJECT,
                         help=f"filter by cwd prefix (default {DEFAULT_PROJECT}); "
                              "'any' for no filter")
