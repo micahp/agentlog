@@ -1,6 +1,6 @@
-.TH AGENTLOG 1 "2026-11-11" "agentlog 0.2.0" "User Commands"
+.TH AGENTLOG 1 "2026-11-11" "agentlog 0.3.0" "User Commands"
 .SH NAME
-agentlog \- read and search Claude Code, Codex and pi session logs
+agentlog \- read and search Claude Code, Codex, pi and Hermes session logs
 .SH SYNOPSIS
 .B agentlog
 .I command
@@ -8,7 +8,7 @@ agentlog \- read and search Claude Code, Codex and pi session logs
 .RI [ options ]
 .SH DESCRIPTION
 .B agentlog
-reads the session transcripts of Claude Code, Codex and pi through one interface.
+reads the session transcripts of Claude Code, Codex, pi and Hermes through one interface.
 Its purpose is handoff: when an agent stops mid\-task on a rate limit or a
 crash, the work is stranded in a transcript no other agent can read.
 .B agentlog resume
@@ -28,6 +28,7 @@ stripped so the column shows what the human actually asked.
 .TP
 .B status
 Which recent sessions are rate limited. Checks the 5 most recent by default.
+Hermes is not checked: it records no limit state.
 See
 .B RATE LIMIT DETECTION
 below.
@@ -73,7 +74,7 @@ A path to a log file, read directly.
 These apply to every command and must follow the command name.
 .TP
 .BI \-\-source " name"
-.BR claude ", " codex ", " pi ", or " all
+.BR claude ", " codex ", " pi ", " hermes ", or " all
 (default). Comma\-separated lists are accepted.
 .TP
 .BI \-\-project " path"

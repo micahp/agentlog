@@ -1,6 +1,6 @@
 # agentlog
 
-Read and search session logs from Claude Code, Codex, and pi in one place.
+Read and search session logs from Claude Code, Codex, pi, and Hermes in one place.
 
 When an agent stops mid-task (a rate limit, a crash, or lost context), its work is stuck in a transcript that no other agent can easily read. agentlog reads those transcripts. Another agent can then pick up the task with `agentlog resume`.
 
@@ -30,6 +30,7 @@ agentlog --version
 | claude | `~/.claude/projects/<slug>/<uuid>.jsonl` |
 | codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` |
 | pi | `~/.pi/agent/sessions/<cwd slug>/<ISO time>_<uuid>.jsonl` |
+| hermes | `~/.hermes/state.db` (read only; messages with `active = 1 OR compacted = 1`) |
 
 ## Supported versions
 
@@ -40,6 +41,7 @@ agentlog does not check source versions at run time. The table lists the version
 | Claude Code | 2.1.321 | `~/.claude/projects/` JSONL |
 | Codex CLI | 0.166.0 | `~/.codex/sessions/` rollout JSONL |
 | pi | 1.3.0 | `~/.pi/agent/sessions/` JSONL |
+| Hermes Agent | v0.22.2 (state schema 32) | `~/.hermes/state.db` |
 
 Each release records the versions it was tested with. See the release notes.
 
@@ -48,7 +50,7 @@ Each release records the versions it was tested with. See the release notes.
 | Command | What it does |
 | --- | --- |
 | `list` | Recent sessions, newest first, with the first real prompt of each. |
-| `status` | Which recent sessions hit a rate limit, and whether the limit has reset. |
+| `status` | Which recent Claude, Codex, and pi sessions hit a rate limit, and whether the limit has reset. Hermes is not checked: it records no limit state. |
 | `resume [ref]` | A handoff brief: the user's instructions in order, files touched, the last commands run, and how the session ended. |
 | `show [ref]` | A full readable transcript. |
 | `search REGEX` | Case-insensitive regex search across sessions. |
@@ -103,7 +105,7 @@ Other options that apply to every command:
 
 | Option | Meaning |
 | --- | --- |
-| `--source` | `claude`, `codex`, `pi`, or `all` (the default). Comma-separated lists work. |
+| `--source` | `claude`, `codex`, `pi`, `hermes`, or `all` (the default). Comma-separated lists work. |
 | `--project PATH` | Only sessions whose working directory starts with PATH. Default `/root`. Use `any` for no filter. |
 | `--chars N` | Maximum characters per message block. Default 4000. `0` turns off truncation. |
 | `--out FILE` | Write to FILE instead of standard output. |
@@ -124,5 +126,6 @@ Detection looks at the structure of each log, not at the text. An agent that men
 
 ## Version history
 
+- **0.3.0**: Hermes Agent support for `list`, `show`, `resume`, and `search`. Reads only messages that are active or compacted, so compressed history is not doubled. Not checked by `status`. Tested with Hermes Agent v0.22.2 (state schema 32).
 - **0.2.0**: `--since` and `--until` date filters for `list` and `search`. `--version` flag. Bad date values are usage errors. Tested with Claude Code 2.1.321, Codex CLI 0.166.0, pi 1.3.0.
 - **0.1.0**: the state before the date filters. Source versions were not recorded at release time.

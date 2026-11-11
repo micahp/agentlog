@@ -18,20 +18,22 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 HOME = Path(os.path.expanduser("~"))
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
 PI_SESSIONS = HOME / ".pi" / "agent" / "sessions"
+HERMES_DB = HOME / ".hermes" / "state.db"
 
 DEFAULT_PROJECT = "/root"
-SOURCES = ("claude", "codex", "pi")
+SOURCES = ("claude", "codex", "pi", "hermes")
 
 RATE_LIMIT_RE = re.compile(
     r"rate.?limit|429|usage limit|quota exceeded|too many requests|"
@@ -368,10 +370,75 @@ def load_pi(session):
     return events
 
 
-LOADERS = {"claude": load_claude, "codex": load_codex, "pi": load_pi}
+
+_HERMES_CON = None
+
+
+def hermes_conn():
+    global _HERMES_CON
+    if _HERMES_CON is None:
+        if not HERMES_DB.exists():
+            return None
+        try:
+            _HERMES_CON = sqlite3.connect(f"file:{HERMES_DB}?mode=ro", uri=True,
+                                          timeout=5)
+        except Exception:
+            return None
+    return _HERMES_CON
 
 
 # ---------------------------------------------------------------- discovery
+
+
+def load_hermes(session):
+    events = []
+    con = hermes_conn()
+    if con is None:
+        return events
+    rows = con.execute(
+        "SELECT role, content, tool_name, tool_calls, timestamp FROM messages "
+        "WHERE session_id = ? AND (active = 1 OR compacted = 1) ORDER BY id",
+        (session.sid,),
+    ).fetchall()
+    for role, content, tool_name, tool_calls, ts in rows:
+        role = role or "assistant"
+        if content:
+            parsed = None
+            if isinstance(content, str) and content.lstrip()[:1] in "[{":
+                try:
+                    parsed = json.loads(content)
+                except Exception:
+                    parsed = None
+            if parsed is not None and not isinstance(parsed, (int, float)):
+                got = blocks_to_events(parsed)
+                if got:
+                    for kind, name, text in got:
+                        events.append(dict(role=role, kind=kind, name=name,
+                                           text=text, ts=ts))
+                    continue
+            kind = "result" if role == "tool" else "text"
+            events.append(dict(role=role, kind=kind, name=tool_name,
+                               text=str(content), ts=ts))
+        if tool_calls:
+            try:
+                calls = json.loads(tool_calls)
+            except Exception:
+                calls = []
+            for call in calls if isinstance(calls, list) else []:
+                fn = (call or {}).get("function") or {}
+                events.append(dict(role="assistant", kind="tool",
+                                   name=fn.get("name") or call.get("name"),
+                                   text=str(fn.get("arguments") or ""), ts=ts))
+    return events
+
+
+
+
+# ---------------------------------------------------------------- discovery
+
+
+LOADERS = {"claude": load_claude, "codex": load_codex, "pi": load_pi,
+           "hermes": load_hermes}
 
 
 def claude_cwd(path):
@@ -481,7 +548,32 @@ def discover_pi(project):
     return out
 
 
-DISCOVER = {"claude": discover_claude, "codex": discover_codex, "pi": discover_pi}
+def discover_hermes(project):
+    out = []
+    con = hermes_conn()
+    if con is None:
+        return out
+    try:
+        rows = con.execute(
+            "SELECT id, cwd, started_at, COALESCE(last_activity_at, ended_at, "
+            "started_at), title, source, message_count FROM sessions "
+            "WHERE COALESCE(archived,0)=0 ORDER BY 4 DESC LIMIT 400"
+        ).fetchall()
+    except Exception:
+        return out
+    for sid, cwd, started, updated, title, src, count in rows:
+        if not count:
+            continue
+        if project and cwd and not str(cwd).startswith(str(project)):
+            continue
+        out.append(Session("hermes", sid, None, cwd=cwd, started=started or 0,
+                           updated=updated or 0, title=title,
+                           extra={"platform": src, "messages": count}))
+    return out
+
+
+DISCOVER = {"claude": discover_claude, "codex": discover_codex,
+            "pi": discover_pi, "hermes": discover_hermes}
 
 
 def discover(sources, project):
@@ -620,7 +712,7 @@ def render_show(session, args):
 def header(session):
     bits = [
         f"session : {session.ref}",
-        f"file    : {session.path}",
+        f"file    : {session.path or 'sqlite:' + str(HERMES_DB)}",
         f"cwd     : {session.cwd or '?'}",
         f"started : {ts_fmt(session.started)}",
         f"updated : {ts_fmt(session.updated)}  ({age(session.updated)})",
@@ -898,7 +990,16 @@ def pi_status(session):
     return blank_status()
 
 
-STATUS = {"codex": codex_status, "claude": claude_status, "pi": pi_status}
+def hermes_status(session):
+    """Hermes records no rate-limit or error state, so it is always unknown."""
+    info = blank_status()
+    info["state"] = "unknown"
+    info["detail"] = "hermes records no rate-limit state"
+    return info
+
+
+STATUS = {"codex": codex_status, "claude": claude_status, "pi": pi_status,
+          "hermes": hermes_status}
 
 
 def session_status(session):
@@ -998,7 +1099,9 @@ def cmd_list(args):
 
 def cmd_status(args):
     """Which recent sessions are rate limited, and which are still usable."""
-    sessions = discover(args.sources, args.project)[: args.limit]
+    # Hermes records no rate-limit or error state, so status skips it.
+    sources = [src for src in args.sources if src != "hermes"]
+    sessions = discover(sources, args.project)[: args.limit]
     rows, limited = [], []
     for session in sessions:
         info = session_status(session)
@@ -1144,7 +1247,7 @@ def main():
                         version=f"agentlog {__version__}")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--source", default="all",
-                        help="claude|codex|pi|all (default all)")
+                        help="claude|codex|pi|hermes|all (default all)")
     common.add_argument("--project", default=DEFAULT_PROJECT,
                         help=f"filter by cwd prefix (default {DEFAULT_PROJECT}); "
                              "'any' for no filter")
