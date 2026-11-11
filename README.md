@@ -136,6 +136,7 @@ If a source changes its log format, add a fixture that shows the new shape, then
 
 ## Version history
 
+- **0.3.1**: regression tests and fixtures for all four sources. No change to behavior.
 - **0.3.0**: Hermes Agent support for `list`, `show`, `resume`, and `search`. Reads only messages that are active or compacted, so compressed history is not doubled. Not checked by `status`. Tested with Hermes Agent v0.22.2 (state schema 32).
 - **0.2.0**: `--since` and `--until` date filters for `list` and `search`. `--version` flag. Bad date values are usage errors. Tested with Claude Code 2.1.321, Codex CLI 0.166.0, pi 1.3.0.
 - **0.1.0**: the state before the date filters. Source versions were not recorded at release time.
