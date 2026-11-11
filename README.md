@@ -31,6 +31,18 @@ agentlog --version
 | codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` |
 | pi | `~/.pi/agent/sessions/<cwd slug>/<ISO time>_<uuid>.jsonl` |
 
+## Supported versions
+
+agentlog does not check source versions at run time. The table lists the versions it was tested against. Other versions may work. Check the output when you upgrade a source.
+
+| Source | Tested version | Log location or store |
+| --- | --- | --- |
+| Claude Code | 2.1.321 | `~/.claude/projects/` JSONL |
+| Codex CLI | 0.166.0 | `~/.codex/sessions/` rollout JSONL |
+| pi | 1.3.0 | `~/.pi/agent/sessions/` JSONL |
+
+Each release records the versions it was tested with. See the release notes.
+
 ## Commands
 
 | Command | What it does |
@@ -112,5 +124,5 @@ Detection looks at the structure of each log, not at the text. An agent that men
 
 ## Version history
 
-- **0.2.0**: `--since` and `--until` date filters for `list` and `search`. `--version` flag. Bad date values are usage errors.
-- **0.1.0**: the state before the date filters.
+- **0.2.0**: `--since` and `--until` date filters for `list` and `search`. `--version` flag. Bad date values are usage errors. Tested with Claude Code 2.1.321, Codex CLI 0.166.0, pi 1.3.0.
+- **0.1.0**: the state before the date filters. Source versions were not recorded at release time.
