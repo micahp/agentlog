@@ -1,6 +1,6 @@
-.TH AGENTLOG 1 "2026-09-08" "agentlog" "User Commands"
+.TH AGENTLOG 1 "2026-11-11" "agentlog 0.2.0" "User Commands"
 .SH NAME
-agentlog \- read and search Claude Code and Codex session logs
+agentlog \- read and search Claude Code, Codex and pi session logs
 .SH SYNOPSIS
 .B agentlog
 .I command
@@ -8,7 +8,7 @@ agentlog \- read and search Claude Code and Codex session logs
 .RI [ options ]
 .SH DESCRIPTION
 .B agentlog
-reads the session transcripts of both coding agents through one interface.
+reads the session transcripts of Claude Code, Codex and pi through one interface.
 Its purpose is handoff: when an agent stops mid\-task on a rate limit or a
 crash, the work is stranded in a transcript no other agent can read.
 .B agentlog resume
@@ -73,7 +73,7 @@ A path to a log file, read directly.
 These apply to every command and must follow the command name.
 .TP
 .BI \-\-source " name"
-.BR claude ", " codex ", or " all
+.BR claude ", " codex ", " pi ", or " all
 (default). Comma\-separated lists are accepted.
 .TP
 .BI \-\-project " path"
@@ -100,6 +100,18 @@ Command\-specific options:
 .TP
 .BR list " " \-\-limit " \fIn\fR, " \-\-since\-hours " \fIn\fR, " \-\-json
 .TP
+.BR list ", " search " " \-\-since " \fIdate\fR, " \-\-until " \fIdate\fR
+Only sessions updated in the window. A
+.I date
+is
+.I YYYY\-MM\-DD
+or
+.IR "YYYY\-MM\-DD HH:MM" ,
+in local time. A date given to
+.B \-\-until
+covers its whole day. Bad values are usage errors. These combine with
+.BR \-\-since\-hours .
+.TP
 .BR status " " \-n ", " \-\-limit " \fIn\fR, " \-\-json
 .TP
 .BR resume " " \-\-tail " \fIn\fR"
@@ -115,7 +127,10 @@ Skip the confirmation described under
 .BR show " " \-\-tools ", " \-\-thinking ", " \-\-system
 Include tool call bodies and results, reasoning, and system messages.
 .TP
-.BR search " " \-\-limit " \fIn\fR, " \-\-scan " \fIn\fR, " \-\-per\-session " \fIn\fR, " \-\-case ", " \-\-tools
+.BR search " " \-\-limit " \fIn\fR, " \-\-scan " \fIn\fR, " \-\-per\-session " \fIn\fR, " \-\-since\-hours " \fIn\fR, " \-\-case ", " \-\-tools
+.TP
+.B \-\-version
+Print the version and exit.
 .SH RATE LIMIT DETECTION
 Detection is structural. An agent that
 .I mentions
