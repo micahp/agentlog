@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """agentlog - read/search session logs from Claude Code, Codex and pi.
 
+Version 0.2.0: list and search accept --since/--until (YYYY-MM-DD or
+YYYY-MM-DD HH:MM, local time) alongside --since-hours.
+
 Purpose: when one agent dies mid-task (rate limit, crash, context loss), another
 agent runs `agentlog resume latest` and gets a handoff brief with enough context
 to continue the same work.
@@ -19,6 +22,8 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+__version__ = "0.2.0"
 
 HOME = Path(os.path.expanduser("~"))
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
@@ -923,11 +928,57 @@ def detect_end(session, events):
 # ---------------------------------------------------------------- commands
 
 
+def parse_when(text):
+    """Parse YYYY-MM-DD or YYYY-MM-DD HH:MM (local time) to epoch seconds.
+
+    Returns (epoch, date_only). A date-only value is returned as its start.
+    """
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).timestamp(), fmt == "%Y-%m-%d"
+        except ValueError:
+            continue
+    raise argparse.ArgumentTypeError(
+        f"bad time {text!r}: use YYYY-MM-DD or YYYY-MM-DD HH:MM")
+
+
+def check_when(text):
+    """argparse type: reject a bad time at parse time, with a usage error."""
+    parse_when(text)
+    return text
+
+
+def parse_until(text):
+    """--until is inclusive: a date-only value covers that whole day."""
+    epoch, date_only = parse_when(text)
+    return epoch + 86400 if date_only else epoch
+
+
+def time_window(args):
+    """Return (since, until) epoch bounds, or None where unset."""
+    since = until = None
+    if args.since_hours:
+        since = time.time() - args.since_hours * 3600
+    if args.since:
+        since = parse_when(args.since)[0]
+    if args.until:
+        until = parse_until(args.until)
+    return since, until
+
+
+def in_window(updated, window):
+    since, until = window
+    if since is not None and updated < since:
+        return False
+    if until is not None and updated >= until:
+        return False
+    return True
+
+
 def cmd_list(args):
     sessions = discover(args.sources, args.project)
-    if args.since_hours:
-        cutoff = time.time() - args.since_hours * 3600
-        sessions = [s for s in sessions if s.updated >= cutoff]
+    window = time_window(args)
+    sessions = [s for s in sessions if in_window(s.updated, window)]
     sessions = sessions[: args.limit]
     if args.json:
         print(json.dumps([dict(source=s.source, id=s.sid,
@@ -1040,9 +1091,8 @@ def confirm_expired(session, args):
 def cmd_search(args):
     pattern = re.compile(args.query, re.I if not args.case else 0)
     sessions = discover(args.sources, args.project)
-    if args.since_hours:
-        cutoff = time.time() - args.since_hours * 3600
-        sessions = [s for s in sessions if s.updated >= cutoff]
+    window = time_window(args)
+    sessions = [s for s in sessions if in_window(s.updated, window)]
     hits, scanned = 0, 0
     for session in sessions[: args.scan]:
         scanned += 1
@@ -1090,6 +1140,8 @@ def main():
         prog="agentlog",
         description="Read and search Claude Code, Codex and pi session logs "
                     "so another agent can resume an interrupted task.")
+    parser.add_argument("--version", action="version",
+                        version=f"agentlog {__version__}")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--source", default="all",
                         help="claude|codex|pi|all (default all)")
@@ -1107,6 +1159,10 @@ def main():
     p = add("list", "list recent sessions, newest first")
     p.add_argument("--limit", type=int, default=25)
     p.add_argument("--since-hours", type=float, default=0)
+    p.add_argument("--since", type=check_when, help="only sessions updated at or "
+                                   "after this time: YYYY-MM-DD or YYYY-MM-DD HH:MM")
+    p.add_argument("--until", type=check_when, help="only sessions updated before "
+                                   "this time (a date covers its whole day)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_list)
 
@@ -1140,6 +1196,10 @@ def main():
     p.add_argument("--scan", type=int, default=150, help="max sessions to scan")
     p.add_argument("--per-session", type=int, default=3)
     p.add_argument("--since-hours", type=float, default=0)
+    p.add_argument("--since", type=check_when, help="only sessions updated at or "
+                                   "after this time: YYYY-MM-DD or YYYY-MM-DD HH:MM")
+    p.add_argument("--until", type=check_when, help="only sessions updated before "
+                                   "this time (a date covers its whole day)")
     p.add_argument("--case", action="store_true")
     p.add_argument("--tools", action="store_true", help="also search tool output")
     p.set_defaults(func=cmd_search)
