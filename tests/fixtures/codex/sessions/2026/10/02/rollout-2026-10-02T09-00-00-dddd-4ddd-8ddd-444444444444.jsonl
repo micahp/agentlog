@@ -1,0 +1,4 @@
+{"timestamp":"2026-10-02T09:00:00Z","type":"session_meta","payload":{"session_id":"codex-limit-0002","cwd":"/root/demo-app"}}
+{"timestamp":"2026-10-02T09:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Port the CLI to the new config format."}]}}
+{"timestamp":"2026-10-02T09:00:05Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":100.0,"resets_at":4102444800}}}}
+{"timestamp":"2026-10-02T09:00:06Z","type":"event_msg","payload":{"type":"task_complete","error":{"codex_error_info":"usage_limit_exceeded","message":"You've hit your usage limit."}}}

@@ -119,6 +119,16 @@ Detection looks at the structure of each log, not at the text. An agent that men
 
 `status` reports each session as RATE LIMITED, OK, or unknown.
 
+## Tests
+
+The tests use only the standard library. They run against made-up session files in `tests/fixtures/`, one set per source, and never read the real `~/.claude`, `~/.codex`, `~/.pi`, or `~/.hermes`.
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+If a source changes its log format, add a fixture that shows the new shape, then fix the parser until the tests pass.
+
 ## Notes
 
 - Reads only. agentlog does not change any session file.

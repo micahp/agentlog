@@ -1,0 +1,5 @@
+{"type":"session","id":"pi-ok-0001","cwd":"/root/demo-app","timestamp":"2026-10-01T10:00:00Z"}
+{"type":"message","timestamp":"2026-10-01T10:00:01Z","message":{"role":"user","content":[{"type":"text","text":"Rename the config key to snake_case."}]}}
+{"type":"message","timestamp":"2026-10-01T10:00:04Z","message":{"role":"assistant","content":[{"type":"text","text":"Renaming the key in config.py."},{"type":"toolCall","name":"edit","arguments":{"path":"config.py"}}]}}
+{"type":"message","timestamp":"2026-10-01T10:00:06Z","message":{"role":"toolResult","content":[{"type":"text","text":"edited config.py"}]}}
+{"type":"message","timestamp":"2026-10-01T10:00:08Z","message":{"role":"assistant","content":[{"type":"text","text":"The key is now config_name everywhere."}]}}

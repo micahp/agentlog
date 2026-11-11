@@ -1,0 +1,3 @@
+{"type":"user","cwd":"/root/demo-app","timestamp":"2026-10-02T09:00:00Z","message":{"role":"user","content":"Refactor the parser module."}}
+{"type":"assistant","timestamp":"2026-10-02T09:00:04Z","message":{"role":"assistant","content":[{"type":"text","text":"Starting the refactor."}]}}
+{"type":"assistant","isApiErrorMessage":true,"timestamp":"2026-10-02T09:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"API Error: Rate limit reached for this account. Upgrade to increase your limit."}]}}
